@@ -4,9 +4,42 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>The Global Summons — Delegates App</title>
+
+<!-- React -->
 <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<!-- Firebase (modular SDK via ES modules) -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getFirestore, doc, onSnapshot, setDoc
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  const firebaseConfig = {
+  apiKey: "AIzaSyAzdYr3U3aFSWK-xWD0b60LSpGMZSrRDg8",
+  authDomain: "global-summons.firebaseapp.com",
+  projectId: "global-summons",
+  storageBucket: "global-summons.firebasestorage.app",
+  messagingSenderId: "184992686349",
+  appId: "1:184992686349:web:0873eba79fad68e80d1044"
+};
+
+  const fbApp = initializeApp(firebaseConfig);
+  const db = getFirestore(fbApp);
+  const sessionDocRef = doc(db, "sessions", "main");
+
+  // Expose to the global scope so our Babel-compiled React script (loaded as a classic script) can use them
+  window._firestoreDocRef = sessionDocRef;
+  window._firestoreOnSnapshot = onSnapshot;
+  window._firestoreSetDoc = setDoc;
+
+  // Signal that Firebase is ready, then boot the React app
+  window._firebaseReady = true;
+  window.dispatchEvent(new Event("firebase-ready"));
+</script>
+
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { width: 100%; min-height: 100vh; background: #0d0805; color: #f0e6d3; font-family: Georgia, serif; }
@@ -16,10 +49,9 @@ input, textarea, button { font-family: Georgia, serif; }
 </head>
 <body>
 <div id="root"></div>
-<script type="text/babel">
-const { useState, useRef } = React;
 
-
+<script type="text/babel" data-presets="env,react">
+const { useState, useRef, useEffect } = React;
 
 const GM_PASSWORD = "assembly";
 const DICE_SEQUENCE = [4, 6, 8, 10, 12, 20];
@@ -875,41 +907,152 @@ const TI={width:"100%",background:"rgba(255,255,255,0.04)",border:"1px solid rgb
 function inlineInput(extra={}){ return {background:"none",border:"none",borderBottom:"1px solid rgba(255,255,255,0.07)",outline:"none",width:"100%",display:"block",padding:"3px 0",...extra}; }
 
 // ── ROOT ──────────────────────────────────────────────────────
+
+// ── FIRESTORE-BACKED APP ──────────────────────────────────────
+const SESSION_DOC_PATH = ["sessions", "main"]; // single shared session document
+
 function App() {
-  const [view,setView]=useState(null);
-  const [players,setPlayers]=useState([makeDefaultPlayer(1),makeDefaultPlayer(2)]);
-  const [gmState,setGmState]=useState(makeDefaultGMState());
-  const [notifications,setNotifications]=useState([]);
-  function updatePlayer(idx,updated){ setPlayers(prev=>{const n=[...prev];n[idx]=updated;return n;}); }
-  function sendNotification({message,to}){ const ts=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); setNotifications(prev=>[{id:Date.now(),message,to,timestamp:ts},...prev]); }
-  function loadState(state){
-    if(state.players)setPlayers(state.players.map(p=>({...makeDefaultPlayer(1),...p,baseDice:p.baseDice||p.stats||makeDefaultPlayer(1).baseDice,bloodiedStats:p.bloodiedStats||[],breakingStats:p.breakingStats||[]})));
-    if(state.gmState){
-      const newGM = {...makeDefaultGMState(),...state.gmState};
-      // Migrate old string-format delegates to object format
+  const [view, setView] = useState(null);
+  const [players, setPlayers] = useState([makeDefaultPlayer(1), makeDefaultPlayer(2)]);
+  const [gmState, setGmState] = useState(makeDefaultGMState());
+  const [notifications, setNotifications] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const docRef = window._firestoreDocRef;
+  const isFirstLoad = useRef(true);
+  const writingRef = useRef(false);
+
+  // Subscribe to Firestore in real time
+  useEffect(() => {
+    if (!docRef) { setLoading(false); return; }
+    const unsub = window._firestoreOnSnapshot(docRef, (snap) => {
+      setConnected(true);
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data.players) {
+          setPlayers(data.players.map(p => ({
+            ...makeDefaultPlayer(1), ...p,
+            baseDice: p.baseDice || makeDefaultPlayer(1).baseDice,
+            bloodiedStats: p.bloodiedStats || [],
+            breakingStats: p.breakingStats || [],
+            abilities: p.abilities || makeDefaultPlayer(1).abilities,
+            inventory: p.inventory || [],
+          })));
+        }
+        if (data.gmState) {
+          const newGM = { ...makeDefaultGMState(), ...data.gmState };
+          const dels = newGM.delegates || {};
+          DELEGATE_PAIRS.forEach(d => {
+            if (typeof dels[d.id] === "string") dels[d.id] = { m1: dels[d.id], m2: dels[d.id] };
+            else if (!dels[d.id]) dels[d.id] = { m1: "active", m2: "active" };
+          });
+          newGM.delegates = dels;
+          setGmState(newGM);
+        }
+        if (data.notifications) setNotifications(data.notifications);
+      } else {
+        // No doc yet — initialize it
+        pushToFirestore({
+          players: [makeDefaultPlayer(1), makeDefaultPlayer(2)],
+          gmState: makeDefaultGMState(),
+          notifications: [],
+        });
+      }
+      setLoading(false);
+      isFirstLoad.current = false;
+    }, (err) => {
+      console.error("Firestore error:", err);
+      setConnected(false);
+      setLoading(false);
+    });
+    return () => unsub && unsub();
+  }, []);
+
+  function pushToFirestore(partial) {
+    if (!docRef) return;
+    window._firestoreSetDoc(docRef, partial, { merge: true }).catch(e => console.error("Write error:", e));
+  }
+
+  function updatePlayer(idx, updated) {
+    setPlayers(prev => {
+      const n = [...prev];
+      n[idx] = updated;
+      pushToFirestore({ players: n });
+      return n;
+    });
+  }
+
+  function updateGmState(updated) {
+    setGmState(updated);
+    pushToFirestore({ gmState: updated });
+  }
+
+  function sendNotification({ message, to }) {
+    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    setNotifications(prev => {
+      const next = [{ id: Date.now(), message, to, timestamp: ts }, ...prev].slice(0, 200);
+      pushToFirestore({ notifications: next });
+      return next;
+    });
+  }
+
+  function loadState(state) {
+    if (state.players) {
+      const newPlayers = state.players.map(p => ({
+        ...makeDefaultPlayer(1), ...p,
+        baseDice: p.baseDice || p.stats || makeDefaultPlayer(1).baseDice,
+        bloodiedStats: p.bloodiedStats || [],
+        breakingStats: p.breakingStats || [],
+      }));
+      setPlayers(newPlayers);
+      pushToFirestore({ players: newPlayers });
+    }
+    if (state.gmState) {
+      const newGM = { ...makeDefaultGMState(), ...state.gmState };
       const dels = newGM.delegates || {};
-      DELEGATE_PAIRS.forEach(d=>{
-        if(typeof dels[d.id]==="string") dels[d.id]={m1:dels[d.id],m2:dels[d.id]};
-        else if(!dels[d.id]) dels[d.id]={m1:"active",m2:"active"};
+      DELEGATE_PAIRS.forEach(d => {
+        if (typeof dels[d.id] === "string") dels[d.id] = { m1: dels[d.id], m2: dels[d.id] };
+        else if (!dels[d.id]) dels[d.id] = { m1: "active", m2: "active" };
       });
       newGM.delegates = dels;
       setGmState(newGM);
+      pushToFirestore({ gmState: newGM });
     }
-    if(state.notifications)setNotifications(state.notifications);
+    if (state.notifications) {
+      setNotifications(state.notifications);
+      pushToFirestore({ notifications: state.notifications });
+    }
   }
-  const bg={minHeight:"100vh",background:"linear-gradient(160deg,#0d0805 0%,#1a0f0a 50%,#0d0508 100%)",color:"#f0e6d3",fontFamily:"Georgia,serif"};
-  if(!view)return <div style={bg}><LoginScreen onSelect={setView}/></div>;
+
+  const bg = { minHeight: "100vh", background: "linear-gradient(160deg,#0d0805 0%,#1a0f0a 50%,#0d0508 100%)", color: "#f0e6d3", fontFamily: "Georgia,serif" };
+
+  if (loading) {
+    return (
+      <div style={{ ...bg, display:"flex", alignItems:"center", justifyContent:"center" }}>
+        <div style={{ textAlign:"center" }}>
+          <div style={{ fontSize:11, color:"#b8860b", letterSpacing:3, textTransform:"uppercase", marginBottom:10 }}>Connecting</div>
+          <div style={{ fontSize:13, color:"#5a4a3a" }}>The Continental Assembly is establishing contact...</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!view) return <div style={bg}><LoginScreen onSelect={setView}/></div>;
+
   return (
     <div style={bg}>
       <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 20px",borderBottom:"1px solid rgba(255,255,255,0.05)",background:"rgba(0,0,0,0.25)" }}>
-        <div style={{ fontSize:9,color:"#2a1a0a",letterSpacing:2,textTransform:"uppercase" }}>Global Summons Delegates App</div>
+        <div style={{ fontSize:9,color:"#2a1a0a",letterSpacing:2,textTransform:"uppercase",display:"flex",alignItems:"center",gap:8 }}>
+          Global Summons Delegates App
+          <span style={{ width:6,height:6,borderRadius:"50%",background:connected?"#2d7a2d":"#7a2d2d",display:"inline-block" }} title={connected?"Live":"Offline"}></span>
+        </div>
         <button onClick={()=>setView(null)} style={{ background:"none",border:"none",color:"#2a1a0a",fontSize:10,cursor:"pointer",letterSpacing:1 }}>Switch View</button>
       </div>
       {view==="player1"&&<PlayerView playerId="player1" player={players[0]} onUpdate={p=>updatePlayer(0,p)} gmState={gmState} notifications={notifications} players={players}/>}
       {view==="player2"&&<PlayerView playerId="player2" player={players[1]} onUpdate={p=>updatePlayer(1,p)} gmState={gmState} notifications={notifications} players={players}/>}
       {view==="gm"&&(
         <>
-          <GMView players={players} onUpdatePlayer={updatePlayer} gmState={gmState} onUpdateGM={setGmState} notifications={notifications} onSendNotification={sendNotification}/>
+          <GMView players={players} onUpdatePlayer={updatePlayer} gmState={gmState} onUpdateGM={updateGmState} notifications={notifications} onSendNotification={sendNotification}/>
           <SaveLoad state={{players,gmState,notifications}} onLoad={loadState}/>
         </>
       )}
@@ -918,8 +1061,19 @@ function App() {
 }
 
 
-const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
+function boot() {
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  root.render(<App />);
+}
+
+// Wait for Firebase to finish initializing before mounting React
+if (window._firebaseReady) {
+  boot();
+} else {
+  window.addEventListener("firebase-ready", boot);
+  // Fallback in case the event fires before this listener attaches
+  setTimeout(() => { if (!document.getElementById('root').hasChildNodes()) boot(); }, 1500);
+}
 </script>
 </body>
 </html>
